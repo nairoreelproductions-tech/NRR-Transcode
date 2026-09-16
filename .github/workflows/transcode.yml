@@ -1,0 +1,89 @@
+# NOT part of portal-v2 -- this file belongs in the NEW, separate PUBLIC repo
+# Brandon creates for this (workflow-only, no portal code). Save it there as
+# .github/workflows/transcode.yml. Left in portal-v2/sessions/ purely as a
+# handoff artifact for this session; it is not read by anything at runtime.
+#
+# Repo secrets required (Settings -> Secrets and variables -> Actions):
+#   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+#   (the PROD bucket's credentials -- same ones already in the portal's
+#   production .env, just also added here as repo secrets)
+#
+# Note what is deliberately NOT a secret here: the callback signature is
+# computed by the portal (includes/transcode.php's signTranscodeCallback())
+# and handed to this workflow via client_payload.signature -- the workflow
+# only echoes it back, so TRANSCODE_CALLBACK_SECRET never needs to exist
+# outside the portal's own .env. One fewer secret to keep in sync.
+
+name: Transcode review proxy
+
+on:
+  repository_dispatch:
+    types: [transcode]
+
+jobs:
+  transcode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Compute keys
+        id: keys
+        run: |
+          MEDIA_KEY="${{ github.event.client_payload.media_key }}"
+          PROXY_KEY="$(dirname "$MEDIA_KEY")/proxy.mp4"
+          echo "media_key=$MEDIA_KEY" >> "$GITHUB_OUTPUT"
+          echo "proxy_key=$PROXY_KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Download master from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3api get-object \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
+            --bucket "${{ secrets.R2_BUCKET }}" \
+            --key "${{ steps.keys.outputs.media_key }}" \
+            master.mp4
+
+      - name: Transcode
+        # Verified 2026-09-13 against a real 409MB/64.7Mbps 1080p test file:
+        # ~43s on a consumer CPU, ~29MB output, faststart confirmed via
+        # ffprobe. GitHub's ubuntu-latest private-repo runner is 2 vCPU (this
+        # repo is public, so it's the 4 vCPU runner instead -- faster than
+        # what was benchmarked, not slower).
+        run: |
+          ffmpeg -y -i master.mp4 \
+            -c:v libx264 -preset fast -b:v 6M -maxrate 6.5M -bufsize 12M \
+            -c:a aac -b:a 128k \
+            -movflags +faststart \
+            proxy.mp4
+
+      - name: Upload proxy to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          aws s3api put-object \
+            --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
+            --bucket "${{ secrets.R2_BUCKET }}" \
+            --key "${{ steps.keys.outputs.proxy_key }}" \
+            --body proxy.mp4 \
+            --content-type video/mp4
+
+      - name: Report success
+        if: success()
+        run: |
+          curl -sf -X POST "${{ github.event.client_payload.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"approval_id\": ${{ github.event.client_payload.approval_id }}, \"signature\": \"${{ github.event.client_payload.signature }}\", \"status\": \"ok\", \"proxy_key\": \"${{ steps.keys.outputs.proxy_key }}\"}"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          curl -sf -X POST "${{ github.event.client_payload.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"approval_id\": ${{ github.event.client_payload.approval_id }}, \"signature\": \"${{ github.event.client_payload.signature }}\", \"status\": \"failed\"}"
