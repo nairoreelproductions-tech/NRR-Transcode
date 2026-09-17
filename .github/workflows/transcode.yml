@@ -25,6 +25,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Checkout
+        # NEW 2026-09-17, required by the "Use Boska font" step below, which
+        # reads assets/Boska-Black.ttf out of this repo's own checkout. This
+        # workflow never needed the repo's files on disk before (R2 in, R2
+        # out, no local asset reads) -- without this step the font step's
+        # own [ -f ... ] check would ALWAYS be false regardless of where the
+        # font file is committed, silently falling back to DejaVu Sans every
+        # run with no visible failure. Caught before Brandon pasted this
+        # file into the real external repo, not after.
+        uses: actions/checkout@v4
+
       - name: Install ffmpeg
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
 
@@ -48,14 +59,120 @@ jobs:
             --key "${{ steps.keys.outputs.media_key }}" \
             master.mp4
 
+      - name: Use Boska font
+        # HANDOFF ACTION FOR BRANDON: commit portal-v2's
+        # public_html/assets/fonts/Boska-Black.ttf into THIS repo at
+        # assets/Boska-Black.ttf (same handoff pattern as this whole file --
+        # a small binary, no network fetch needed at transcode time). Until
+        # that's done, every run falls back to DejaVu Sans Bold (present on
+        # ubuntu-latest by default) with a visible warning in the run log --
+        # never a silent font substitution.
+        run: |
+          if [ -f "assets/Boska-Black.ttf" ]; then
+            cp assets/Boska-Black.ttf boska.ttf
+          else
+            echo "::warning::assets/Boska-Black.ttf not committed to this repo yet -- see this step's comment. Falling back to DejaVu Sans Bold for this run."
+          fi
+
+      - name: Build watermark slate
+        # 2026-09-17 design, ffmpeg-verified locally against synthetic test
+        # frames at 16:9, 9:16 and 1:1 before landing here (not just reasoned
+        # about) -- corner brackets (drawbox), Boska wordmark top-left,
+        # elapsed-time clock (HH:MM:SS, no frame count -- no reliable fps
+        # source exists yet, see PHASE-4A-PLAN.md sec8), asset-type + FOR
+        # REVIEW / project-client line bottom-right. Proportions scale off
+        # min(width,height) so the same construction holds at any aspect
+        # ratio (verified: 720-height base numbers below came from a 1280x720
+        # test render; reused unchanged for a 720-wide 9x16 render because
+        # min(1280,720) == min(720,1280) == 720 -- genuinely dimension-
+        # relative, not a landscape-only hack).
+        #
+        # Portrait gets the clock stacked under the logo instead of top-right
+        # -- there is no room for both at typical vertical-video widths (a
+        # real bug found and fixed in the browser DOM-overlay skeleton this
+        # mirrors: _lab/watermark-slate-skeleton.html). NOTE this is a
+        # deliberate deviation from that skeleton's rotated side-label
+        # treatment for the same case: ffmpeg's drawtext has no text-rotation
+        # option, so replicating a rotated label here would need a pre-
+        # rendered image composited via overlay -- real extra complexity for
+        # a secondary field. Flagged for Brandon's sign-off, not silently
+        # decided.
+        #
+        # Dynamic text (project name, client name -- free-typed admin input,
+        # can contain quotes/colons/anything) goes through textfile=, NOT
+        # text=, specifically so nothing here needs ffmpeg filter-syntax
+        # escaping. asset_type and the static labels are safe literals and
+        # use text= directly.
+        run: |
+          set -e
+          # default=noprint_wrappers=1, not csv=p=0:s=' ' -- verified locally
+          # that the csv separator form fails to parse on at least one real
+          # ffprobe build ("Failed to parse option string"); this form is the
+          # one that actually printed width=/height= reliably.
+          PROBE=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of default=noprint_wrappers=1 master.mp4)
+          W=$(echo "$PROBE" | grep '^width=' | cut -d= -f2)
+          H=$(echo "$PROBE" | grep '^height=' | cut -d= -f2)
+          MIN=$(( W < H ? W : H ))
+
+          INSET=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.055}')
+          BRACKET=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.036}')
+          STROKE=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.030}')
+          GAP=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.022}')
+          FS_LOGO=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.026}')
+          FS_SUB=$(awk -v m="$MIN"   'BEGIN{printf "%d", m*0.014}')
+          FS_CLOCK=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.0236}')
+          FS_L1=$(awk -v m="$MIN"    'BEGIN{printf "%d", m*0.018}')
+          FS_L2=$(awk -v m="$MIN"    'BEGIN{printf "%d", m*0.0167}')
+
+          FONT=boska.ttf
+          [ -f "$FONT" ] || FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+          PROJECT_NAME="${{ github.event.client_payload.project_name }}"
+          CLIENT_NAME="${{ github.event.client_payload.client_name }}"
+          ASSET_TYPE="${{ github.event.client_payload.asset_type }}"
+          printf '%s' "${PROJECT_NAME:-Untitled Project} \xe2\x80\x93 ${CLIENT_NAME:-NairoReel Client}" > line1.txt
+          printf '%s' "${ASSET_TYPE:-Review} | FOR REVIEW" > line2.txt
+
+          CLOCK_EXPR='%{eif\:trunc(t/3600)\:d\:2}\:%{eif\:mod(trunc(t/60)\,60)\:d\:2}\:%{eif\:mod(trunc(t)\,60)\:d\:2}'
+
+          {
+            echo "drawbox=x=$INSET:y=$INSET:w=$BRACKET:h=2:color=white@0.55:t=fill,"
+            echo "drawbox=x=$INSET:y=$INSET:w=2:h=$BRACKET:color=white@0.55:t=fill,"
+            echo "drawbox=x=iw-$INSET-$BRACKET:y=$INSET:w=$BRACKET:h=2:color=white@0.55:t=fill,"
+            echo "drawbox=x=iw-$INSET-2:y=$INSET:w=2:h=$BRACKET:color=white@0.55:t=fill,"
+            echo "drawbox=x=$INSET:y=ih-$INSET-$STROKE:w=2:h=$STROKE:color=white@0.4:t=fill,"
+            echo "drawbox=x=iw-$INSET-2:y=ih-$INSET-$STROKE:w=2:h=$STROKE:color=white@0.4:t=fill,"
+            echo "drawtext=fontfile='$FONT':text='NAIROREEL':x=$((INSET+BRACKET+GAP)):y=$((INSET+GAP)):fontsize=$FS_LOGO:fontcolor=white@0.36,"
+            echo "drawtext=fontfile='$FONT':text='MEDIA':x=$((INSET+BRACKET+GAP)):y=$((INSET+GAP+FS_LOGO+4)):fontsize=$FS_SUB:fontcolor=white@0.27,"
+            # drawtext's own expression evaluator does NOT recognise iw/ih
+            # (that is drawbox's naming, used above) -- it wants plain w/h.
+            # Verified the hard way: this exact mix-up produced "Undefined
+            # constant or missing '(' in 'iw...'" against a real ffmpeg
+            # build before it was caught and fixed here.
+            if [ "$H" -gt "$W" ]; then
+              # Portrait -- clock stacked under the logo, see this step's docblock.
+              echo "drawtext=fontfile='$FONT':text='$CLOCK_EXPR':x=$((INSET+BRACKET+GAP)):y=$((INSET+GAP+FS_LOGO+4+FS_SUB+GAP)):fontsize=$FS_CLOCK:fontcolor=white@0.30,"
+            else
+              echo "drawtext=fontfile='$FONT':text='$CLOCK_EXPR':x=w-$INSET-$BRACKET-$GAP-text_w:y=$((INSET+GAP)):fontsize=$FS_CLOCK:fontcolor=white@0.36,"
+            fi
+            echo "drawtext=fontfile='$FONT':textfile=line2.txt:x=w-$INSET-$GAP-text_w:y=h-$INSET-$STROKE-$((FS_L1+FS_L2+GAP)):fontsize=$FS_L1:fontcolor=white@0.36,"
+            echo "drawtext=fontfile='$FONT':textfile=line1.txt:x=w-$INSET-$GAP-text_w:y=h-$INSET-$STROKE-$((FS_L2+GAP)):fontsize=$FS_L2:fontcolor=white@0.26"
+          } > slate.filter
+
       - name: Transcode
         # Verified 2026-09-13 against a real 409MB/64.7Mbps 1080p test file:
         # ~43s on a consumer CPU, ~29MB output, faststart confirmed via
         # ffprobe. GitHub's ubuntu-latest private-repo runner is 2 vCPU (this
         # repo is public, so it's the 4 vCPU runner instead -- faster than
         # what was benchmarked, not slower).
+        #
+        # -filter_script:v (not -vf) -- the slate build writes a FILE because
+        # the filter string is generated from runtime-computed values; -vf
+        # would need the whole thing re-escaped onto one command-line
+        # argument for no benefit.
         run: |
           ffmpeg -y -i master.mp4 \
+            -filter_script:v slate.filter \
             -c:v libx264 -preset fast -b:v 6M -maxrate 6.5M -bufsize 12M \
             -c:a aac -b:a 128k \
             -movflags +faststart \
