@@ -170,10 +170,34 @@ jobs:
         # the filter string is generated from runtime-computed values; -vf
         # would need the whole thing re-escaped onto one command-line
         # argument for no benefit.
+        #
+        # 2026-09-17 FIX: -b:v 6M (a FIXED average-bitrate target) regressed
+        # on a real upload -- an already-compressed 11.64MB/~477kbps source
+        # came back as a 50.12MB/~2Mbps proxy, a 4.3x size INCREASE, because
+        # ABR mode spends its whole bitrate budget regardless of whether the
+        # content needs it. Switched to CRF (quality-targeted): the encoder
+        # now only spends bits the content's actual complexity justifies.
+        # -maxrate/-bufsize stay as a CEILING, not a target, so a genuinely
+        # detailed/high-motion source (a real 3D render) still gets capped at
+        # a sane rate exactly as before.
+        #
+        # Verified locally (not yet re-run on GitHub Actions or against a
+        # real Brandon-supplied file) with real ffmpeg encodes, three
+        # synthetic sources: a low-bitrate/low-motion source (~381kbps, mimics
+        # a screen-captured/already-compressed upload like the one that
+        # triggered this fix) went 6M-ABR -> 14x bloat (20.3MB), crf 20 ->
+        # SMALLER than the source (890KB, 0.62x); a high-bitrate/high-detail
+        # source (~29.5Mbps, mimics a real 3D-render master) went 6M-ABR ->
+        # 11.19MB, crf 20 (capped by -maxrate 6M) -> 11.51MB -- i.e. the
+        # ceiling keeps genuinely detailed content compressing exactly as
+        # well as before. crf 20 (not x264's default 23) chosen to stay close
+        # to the quality bar the old 6M target implied for real content --
+        # this fixes the SIZE bug, not a quality/cost tradeoff Brandon asked
+        # for.
         run: |
           ffmpeg -y -i master.mp4 \
             -filter_script:v slate.filter \
-            -c:v libx264 -preset fast -b:v 6M -maxrate 6.5M -bufsize 12M \
+            -c:v libx264 -preset fast -crf 20 -maxrate 6M -bufsize 12M \
             -c:a aac -b:a 128k \
             -movflags +faststart \
             proxy.mp4
