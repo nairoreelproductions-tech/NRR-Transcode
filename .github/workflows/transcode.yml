@@ -174,8 +174,14 @@ jobs:
             else
               echo "drawtext=fontfile='$FONT':text='$CLOCK_EXPR':x=w-$INSET-$BRACKET-$GAP-text_w:y=$((INSET+GAP)):fontsize=$FS_CLOCK:fontcolor=white@0.36,"
             fi
-            echo "drawtext=fontfile='$FONT':textfile=line2.txt:x=w-$INSET-$GAP-text_w:y=h-$INSET-$STROKE-$((FS_L1+FS_L2+GAP)):fontsize=$FS_L1:fontcolor=white@0.36,"
-            echo "drawtext=fontfile='$FONT':textfile=line1.txt:x=w-$INSET-$GAP-text_w:y=h-$INSET-$STROKE-$((FS_L2+GAP)):fontsize=$FS_L2:fontcolor=white@0.26"
+            # expansion=none on the two free-text lines: by default drawtext treats
+            # a file's text as a TEMPLATE. "%{...}" is evaluated (a project called
+            # "Q3 %{pts} review" burned a timestamp in place of the text) and a
+            # stray "%" or backslash can swallow the WHOLE line (a project called
+            # "50% Off {Sale}" drew nothing at all, with the step still exiting 0).
+            # The clock above NEEDS the default expansion; these two are literal.
+            echo "drawtext=fontfile='$FONT':textfile=line2.txt:expansion=none:x=w-$INSET-$GAP-text_w:y=h-$INSET-$STROKE-$((FS_L1+FS_L2+GAP)):fontsize=$FS_L1:fontcolor=white@0.36,"
+            echo "drawtext=fontfile='$FONT':textfile=line1.txt:expansion=none:x=w-$INSET-$GAP-text_w:y=h-$INSET-$STROKE-$((FS_L2+GAP)):fontsize=$FS_L2:fontcolor=white@0.26"
           } > slate.filter
 
       - name: Transcode
