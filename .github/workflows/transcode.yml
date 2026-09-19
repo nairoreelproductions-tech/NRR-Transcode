@@ -1,7 +1,9 @@
-# NOT part of portal-v2 -- this file belongs in the NEW, separate PUBLIC repo
-# Brandon creates for this (workflow-only, no portal code). Save it there as
-# .github/workflows/transcode.yml. Left in portal-v2/sessions/ purely as a
-# handoff artifact for this session; it is not read by anything at runtime.
+# Transcodes an uploaded review master into a watermarked streaming proxy.
+# THIS repo is the source of truth for this workflow (edit it here). It is a
+# separate, workflow-only repo: the portal (portal-v2, includes/transcode.php)
+# sends a repository_dispatch and receives the HMAC-signed callback, and reads
+# nothing else from here. Design record: portal-v2's TRANSCODE-SETUP.md and
+# CANONICAL.md.
 #
 # Repo secrets required (Settings -> Secrets and variables -> Actions):
 #   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
@@ -74,13 +76,11 @@ jobs:
             master.mp4
 
       - name: Use Boska font
-        # HANDOFF ACTION FOR BRANDON: commit portal-v2's
-        # public_html/assets/fonts/Boska-Black.ttf into THIS repo at
-        # assets/Boska-Black.ttf (same handoff pattern as this whole file --
-        # a small binary, no network fetch needed at transcode time). Until
-        # that's done, every run falls back to DejaVu Sans Bold (present on
-        # ubuntu-latest by default) with a visible warning in the run log --
-        # never a silent font substitution.
+        # assets/Boska-Black.ttf is a copy of portal-v2's
+        # public_html/assets/fonts/Boska-Black.ttf, committed here so there is
+        # no network fetch at transcode time. If it is ever missing, every run
+        # falls back to DejaVu Sans Bold (present on ubuntu-latest) with a
+        # visible warning in the run log -- never a silent font substitution.
         run: |
           if [ -f "assets/Boska-Black.ttf" ]; then
             cp assets/Boska-Black.ttf boska.ttf
@@ -155,6 +155,12 @@ jobs:
           CLOCK_EXPR='%{eif\:trunc(t/3600)\:d\:2}\:%{eif\:mod(trunc(t/60)\,60)\:d\:2}\:%{eif\:mod(trunc(t)\,60)\:d\:2}'
 
           {
+            # OPACITY TUNING: every "@0.xx" below is an alpha (1.0 = solid white).
+            #   0.55 top brackets | 0.40 bottom strokes | 0.36 wordmark, clock and
+            #   asset-type line | 0.30 portrait clock | 0.27 "MEDIA" sub-label |
+            #   0.26 project-client line. Raise a number to make that element
+            # more visible. Only videos transcoded AFTER a change pick it up --
+            # existing proxies keep the values they were burned with.
             echo "drawbox=x=$INSET:y=$INSET:w=$BRACKET:h=2:color=white@0.55:t=fill,"
             echo "drawbox=x=$INSET:y=$INSET:w=2:h=$BRACKET:color=white@0.55:t=fill,"
             echo "drawbox=x=iw-$INSET-$BRACKET:y=$INSET:w=$BRACKET:h=2:color=white@0.55:t=fill,"
