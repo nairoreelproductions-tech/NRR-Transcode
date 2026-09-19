@@ -145,7 +145,11 @@ jobs:
           FONT=boska.ttf
           [ -f "$FONT" ] || FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-          printf '%s' "${PROJECT_NAME:-Untitled Project} \xe2\x80\x93 ${CLIENT_NAME:-NairoReel Client}" > line1.txt
+          # The en-dash escape has to live in printf's FORMAT string: printf only
+          # interprets \xNN there. As part of a %s ARGUMENT it was written to
+          # line1.txt as the literal characters \xe2\x80\x93 and burned onto every
+          # proxy as "xe2x80x93" (found 2026-09-19, visible in a rendered frame).
+          printf '%s \xe2\x80\x93 %s' "${PROJECT_NAME:-Untitled Project}" "${CLIENT_NAME:-NairoReel Client}" > line1.txt
           printf '%s' "${ASSET_TYPE:-Review} | FOR REVIEW" > line2.txt
 
           CLOCK_EXPR='%{eif\:trunc(t/3600)\:d\:2}\:%{eif\:mod(trunc(t/60)\,60)\:d\:2}\:%{eif\:mod(trunc(t)\,60)\:d\:2}'
