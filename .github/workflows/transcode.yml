@@ -25,6 +25,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # RULE FOR THIS FILE: a client_payload value reaches a shell ONLY through
+      # env:, and is used as "$VAR" - never as ${{ }} inside a run: body.
+      # GitHub substitutes ${{ }} as TEXT before bash parses the script, so a
+      # value holding a double quote, $( ) or a backtick becomes shell source.
+      # Reproduced against the real step bodies on 2026-09-19:
+      #   Nike "Just Do It" Reel   -> the step fails (exit 127), no proxy
+      #   Cost $5 Promo            -> "$5" silently vanishes from the burn
+      #   $(cmd)  or  `cmd`        -> RUNS on the runner, which holds the R2 keys
+      # project_name / client_name are free-typed by an admin. The other payload
+      # fields are already constrained by the portal (media_key by a strict
+      # regex, approval_id an int, signature hex), but this repo is its own trust
+      # boundary and should not lean on another repo's validation.
       - name: Checkout
         # NEW 2026-09-17, required by the "Use Boska font" step below, which
         # reads assets/Boska-Black.ttf out of this repo's own checkout. This
@@ -41,8 +53,9 @@ jobs:
 
       - name: Compute keys
         id: keys
+        env:
+          MEDIA_KEY: ${{ github.event.client_payload.media_key }}
         run: |
-          MEDIA_KEY="${{ github.event.client_payload.media_key }}"
           PROXY_KEY="$(dirname "$MEDIA_KEY")/proxy.mp4"
           echo "media_key=$MEDIA_KEY" >> "$GITHUB_OUTPUT"
           echo "proxy_key=$PROXY_KEY" >> "$GITHUB_OUTPUT"
@@ -52,11 +65,12 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          MEDIA_KEY: ${{ steps.keys.outputs.media_key }}
         run: |
           aws s3api get-object \
             --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
             --bucket "${{ secrets.R2_BUCKET }}" \
-            --key "${{ steps.keys.outputs.media_key }}" \
+            --key "$MEDIA_KEY" \
             master.mp4
 
       - name: Use Boska font
@@ -103,6 +117,10 @@ jobs:
         # text=, specifically so nothing here needs ffmpeg filter-syntax
         # escaping. asset_type and the static labels are safe literals and
         # use text= directly.
+        env:
+          PROJECT_NAME: ${{ github.event.client_payload.project_name }}
+          CLIENT_NAME: ${{ github.event.client_payload.client_name }}
+          ASSET_TYPE: ${{ github.event.client_payload.asset_type }}
         run: |
           set -e
           # default=noprint_wrappers=1, not csv=p=0:s=' ' -- verified locally
@@ -127,9 +145,6 @@ jobs:
           FONT=boska.ttf
           [ -f "$FONT" ] || FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-          PROJECT_NAME="${{ github.event.client_payload.project_name }}"
-          CLIENT_NAME="${{ github.event.client_payload.client_name }}"
-          ASSET_TYPE="${{ github.event.client_payload.asset_type }}"
           printf '%s' "${PROJECT_NAME:-Untitled Project} \xe2\x80\x93 ${CLIENT_NAME:-NairoReel Client}" > line1.txt
           printf '%s' "${ASSET_TYPE:-Review} | FOR REVIEW" > line2.txt
 
@@ -207,24 +222,34 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: auto
+          PROXY_KEY: ${{ steps.keys.outputs.proxy_key }}
         run: |
           aws s3api put-object \
             --endpoint-url "https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" \
             --bucket "${{ secrets.R2_BUCKET }}" \
-            --key "${{ steps.keys.outputs.proxy_key }}" \
+            --key "$PROXY_KEY" \
             --body proxy.mp4 \
             --content-type video/mp4
 
       - name: Report success
         if: success()
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          APPROVAL_ID: ${{ github.event.client_payload.approval_id }}
+          SIGNATURE: ${{ github.event.client_payload.signature }}
+          PROXY_KEY: ${{ steps.keys.outputs.proxy_key }}
         run: |
-          curl -sf -X POST "${{ github.event.client_payload.callback_url }}" \
+          curl -sf -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
-            -d "{\"approval_id\": ${{ github.event.client_payload.approval_id }}, \"signature\": \"${{ github.event.client_payload.signature }}\", \"status\": \"ok\", \"proxy_key\": \"${{ steps.keys.outputs.proxy_key }}\"}"
+            -d "{\"approval_id\": $APPROVAL_ID, \"signature\": \"$SIGNATURE\", \"status\": \"ok\", \"proxy_key\": \"$PROXY_KEY\"}"
 
       - name: Report failure
         if: failure()
+        env:
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          APPROVAL_ID: ${{ github.event.client_payload.approval_id }}
+          SIGNATURE: ${{ github.event.client_payload.signature }}
         run: |
-          curl -sf -X POST "${{ github.event.client_payload.callback_url }}" \
+          curl -sf -X POST "$CALLBACK_URL" \
             -H "Content-Type: application/json" \
-            -d "{\"approval_id\": ${{ github.event.client_payload.approval_id }}, \"signature\": \"${{ github.event.client_payload.signature }}\", \"status\": \"failed\"}"
+            -d "{\"approval_id\": $APPROVAL_ID, \"signature\": \"$SIGNATURE\", \"status\": \"failed\"}"
