@@ -136,11 +136,15 @@ jobs:
           BRACKET=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.036}')
           STROKE=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.030}')
           GAP=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.022}')
-          FS_LOGO=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.026}')
-          FS_SUB=$(awk -v m="$MIN"   'BEGIN{printf "%d", m*0.014}')
-          FS_CLOCK=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.0236}')
-          FS_L1=$(awk -v m="$MIN"    'BEGIN{printf "%d", m*0.018}')
-          FS_L2=$(awk -v m="$MIN"    'BEGIN{printf "%d", m*0.0167}')
+          # TEXT SIZE (2026-09-21): all five FS_ fractions are 1.8x what they were (0.026 / 0.014 / 0.0236 /
+          # 0.018 / 0.0167), at Brandon's request: the slate was too small to read at theatre size. They are
+          # fractions of the SHORTER side, so they scale with the video. Only videos transcoded after this pick
+          # it up. The project/client line is shrunk to fit further down when a long name would not.
+          FS_LOGO=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.047}')
+          FS_SUB=$(awk -v m="$MIN"   'BEGIN{printf "%d", m*0.025}')
+          FS_CLOCK=$(awk -v m="$MIN" 'BEGIN{printf "%d", m*0.042}')
+          FS_L1=$(awk -v m="$MIN"    'BEGIN{printf "%d", m*0.032}')
+          FS_L2=$(awk -v m="$MIN"    'BEGIN{printf "%d", m*0.030}')
 
           FONT=boska.ttf
           [ -f "$FONT" ] || FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -149,8 +153,19 @@ jobs:
           # interprets \xNN there. As part of a %s ARGUMENT it was written to
           # line1.txt as the literal characters \xe2\x80\x93 and burned onto every
           # proxy as "xe2x80x93" (found 2026-09-19, visible in a rendered frame).
-          printf '%s \xe2\x80\x93 %s' "${PROJECT_NAME:-Untitled Project}" "${CLIENT_NAME:-NairoReel Client}" > line1.txt
+          printf '%s \xe2\x80\x93 %s' "${PROJECT_NAME:-Untitled Project}" "${CLIENT_NAME:-Nairoreel Client}" > line1.txt
           printf '%s' "${ASSET_TYPE:-Review} | FOR REVIEW" > line2.txt
+
+          # SHRINK-TO-FIT (2026-09-21, with the x1.8 size change). At x1.8 a long "project - client" line ran off the
+          # frame (the bench measured the text starting at column 0 on a 720-wide portrait clip). ffmpeg cannot measure
+          # text before drawing it, so estimate from the character count: assume 0.55 em per character (Boska Black
+          # averages ~0.43, wide capitals more) and shrink the FONT, never the text, until the line fits between the two
+          # insets. A normal name keeps the full size. wc -m counts characters in a UTF-8 locale and bytes otherwise,
+          # which only over-estimates: the safe direction (a smaller font).
+          CH=$(wc -m < line1.txt | tr -d ' \r')
+          FIT=$(( (W - 2*INSET - 2*GAP) * 100 / (CH * 55) ))
+          if [ "$FS_L2" -gt "$FIT" ]; then FS_L2=$FIT; fi
+          if [ "$FS_L2" -lt 8 ]; then FS_L2=8; fi
 
           CLOCK_EXPR='%{eif\:trunc(t/3600)\:d\:2}\:%{eif\:mod(trunc(t/60)\,60)\:d\:2}\:%{eif\:mod(trunc(t)\,60)\:d\:2}'
 

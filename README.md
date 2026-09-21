@@ -1,7 +1,7 @@
 # NRR-Transcode
 
 Workflow-only repo. Transcodes an uploaded review master into a watermarked streaming proxy
-for the NairoReel client portal: the portal sends a `repository_dispatch`, this runs ffmpeg on
+for the Nairoreel client portal: the portal sends a `repository_dispatch`, this runs ffmpeg on
 a GitHub runner, writes the proxy to R2, and calls the portal back (HMAC-signed).
 
 - **This repo is the source of truth** for `.github/workflows/transcode.yml`. Edit it here.

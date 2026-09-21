@@ -69,7 +69,13 @@ CASES = {
     "percent":      ("50% Off {Sale} C:\\Reel", "Acme Ltd", "VFX"),
     "pct_function": ("Q3 %{pts} review", "Acme Ltd", "VFX"),
     "empty_names":  ("", "", ""),  # the bash defaults must apply
+    # Frame-shape cases (rendered on a BLACK master so every lit pixel is slate): a normal name and a very long one, on
+    # landscape and portrait. The long one must never run off the frame.
+    "normal_portrait": ("Test MI6", "MI6", "VFX"),
+    "long_landscape":  ('The Kericho Gold Reserve Anniversary Launch Film - Cut 4', 'Acme Holdings International Ltd', "VFX"),
+    "long_portrait":   ('The Kericho Gold Reserve Anniversary Launch Film - Cut 4', 'Acme Holdings International Ltd', "VFX"),
 }
+SHAPES = {"normal_portrait": (720, 1280), "long_landscape": (1280, 720), "long_portrait": (720, 1280)}
 
 
 def load_workflow(spec):
@@ -112,6 +118,55 @@ def make_master(path):
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25",
                     "-f", "lavfi", "-i", "sine=frequency=440", "-t", "3", "-c:v", "libx264", "-c:a", "aac",
                     "-pix_fmt", "yuv420p", str(path)], check=True)
+
+
+def make_black_master(path, w, h):
+    """A black master of the given shape: on black, every lit pixel of a decoded proxy frame is slate text or a bracket."""
+    if path.exists():
+        return
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r=25",
+                    "-f", "lavfi", "-i", "sine=frequency=440", "-t", "3", "-c:v", "libx264", "-c:a", "aac",
+                    "-pix_fmt", "yuv420p", str(path)], check=True)
+
+
+def lit_columns(proxy, w, h, top, bottom):
+    """Leftmost and rightmost lit pixel columns within rows top..bottom of one decoded frame of the proxy."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", "1.2", "-i", str(proxy), "-frames:v", "1",
+                          "-vf", "format=gray", "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+    lo, hi = w, -1
+    for y in range(max(0, top), min(h, bottom + 1)):
+        for x, v in enumerate(raw[y * w:(y + 1) * w]):
+            if v > 30:
+                lo, hi = min(lo, x), max(hi, x)
+    return lo, hi
+
+
+def slate_fit_checks(wd, case, r):
+    """The burned project/client text must stay between the slate's own insets, whatever the name length or frame shape.
+    (Found 2026-09-21 while making the text 1.8x larger: a long name ran off a portrait frame.)"""
+    w, h = SHAPES[case]
+    filt = read(wd / "slate.filter") or ""
+    text = {("l1" if "line1.txt" in ln else "l2"): ln for ln in filt.splitlines() if "textfile=" in ln}
+    inset = int(re.search(r"drawbox=x=(\d+):y=\1:", filt).group(1))
+    off = lambda ln: sum(int(g) for g in re.search(r"y=h-(\d+)-(\d+)-(\d+)", ln).groups())   # text top, measured up from the bottom
+    fs = lambda ln: int(re.search(r"fontsize=(\d+)", ln).group(1))
+    top, bottom = h - off(text["l2"]), h - off(text["l1"]) + fs(text["l1"])
+    lo, hi = lit_columns(wd / "proxy.mp4", w, h, top, bottom)
+    r.check(lo >= inset and hi <= w - inset,
+            f"the burned text stays inside the slate's insets on a {w}x{h} frame",
+            f"text spans columns {lo}..{hi}; it must stay within {inset}..{w - inset}")
+    if case == "long_portrait":
+        ref = WORK / "cases" / "normal_portrait" / "slate.filter"
+        if ref.exists():
+            ref_fs = fs(next(ln for ln in ref.read_text().splitlines() if "line1.txt" in ln))
+            r.check(fs(text["l1"]) < ref_fs, "a name too long for the frame gets a SMALLER font (never clipped or cut text)",
+                    f"{fs(text['l1'])} px vs {ref_fs} px for a normal name")
+    if case == "normal_portrait":
+        ctrl = WORK / "cases" / "control" / "slate.filter"
+        if ctrl.exists():
+            ctrl_fs = fs(next(ln for ln in ctrl.read_text().splitlines() if "line1.txt" in ln))
+            r.check(fs(text["l1"]) == ctrl_fs, "a normal name keeps the full font size (the fit guard only acts on long names)",
+                    f"{fs(text['l1'])} px vs {ctrl_fs} px")
 
 
 class Results:
@@ -167,7 +222,12 @@ def run_case(doc, case, frames):
            "outputs": {}}
     base = os.environ.copy()
     base["PATH"] = str(wd / "stubs") + os.pathsep + base["PATH"]
-    base["SYNTH_MASTER"] = str(WORK / "master_src.mp4")
+    if case in SHAPES:
+        sw, sh = SHAPES[case]
+        make_black_master(WORK / f"master_black_{sw}x{sh}.mp4", sw, sh)
+        base["SYNTH_MASTER"] = str(WORK / f"master_black_{sw}x{sh}.mp4")
+    else:
+        base["SYNTH_MASTER"] = str(WORK / "master_src.mp4")
     base["GITHUB_OUTPUT"] = str(wd / "gh_output")
     (wd / "gh_output").write_text("")
     codes, err = {}, ""
@@ -205,7 +265,7 @@ def case_checks(doc, case, frames, r):
     ok_steps = all(codes.get(s) == 0 for s in STEPS)
     r.check(ok_steps, "every step exits 0", f"{ {k: v for k, v in codes.items() if v} } {err}")
     r.check(not (wd / "INJECTED").exists(), "nothing in the name was executed as a command")
-    want1 = f"{proj or 'Untitled Project'} {DASH} {client or 'NairoReel Client'}"
+    want1 = f"{proj or 'Untitled Project'} {DASH} {client or 'Nairoreel Client'}"
     want2 = f"{asset or 'Review'} | FOR REVIEW"
     r.check(read(wd / "line1.txt") == want1, "burned project/client line is the exact text, with a real en-dash",
             f"got {read(wd / 'line1.txt')!r}")
@@ -225,6 +285,8 @@ def case_checks(doc, case, frames, r):
         r.check(any(f"[-d] [{body}]" in c for c in calls), "success callback body is exact, valid JSON")
     if frame:
         print(f"      frame: {frame}")
+    if case in SHAPES:
+        slate_fit_checks(wd, case, r)
 
 
 def failure_step_check(doc, r):
