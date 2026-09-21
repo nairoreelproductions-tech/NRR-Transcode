@@ -13,7 +13,10 @@ while the step still exited 0. This bench found all four. It runs the workflow's
     `env:` values are set as real environment variables, exactly as the runner does;
   * `aws` and `curl` are STUBBED (they only record their arguments — so a pass proves the ARGUMENTS the scripts
     build are exact, NOT that R2 or the portal callback accept them);
-  * ffmpeg / ffprobe are REAL, run against a small synthetic 1280x720 master.
+  * ffmpeg / ffprobe are REAL, run against a small synthetic 1280x720 master;
+  * the two callback steps are ALSO run with the REAL curl against a local stand-in for the portal, because the
+    stubbed curl cannot show whether a failed callback is retried (2026-09-21: a DNS failure on the callback left
+    a finished transcode unreported, and nothing in this bench could have caught it).
 
 USAGE
   python tests/test_workflow.py                       test the working-tree workflow
@@ -25,18 +28,22 @@ USAGE
                                                       code cannot: a missing line, a garbled dash)
 Exit 0 = every check passed, 1 = something failed.
 
-NEEDS: python3 + PyYAML, bash (Git Bash on Windows), ffmpeg + ffprobe on PATH. No network, no secrets.
+NEEDS: python3 + PyYAML, bash (Git Bash on Windows), curl, ffmpeg + ffprobe on PATH. No internet (the callback
+checks talk only to a local server and to a name that can never resolve), no secrets.
 OUTPUT goes to the OS temp folder (never into this repo).
 
 WHEN YOU ADD SOMETHING to the workflow that consumes payload text, add a hostile case to CASES below.
 """
 import argparse
+import http.server
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import yaml
@@ -125,6 +132,25 @@ def static_checks(doc, r):
             if not expr.startswith("secrets."):  # repo secrets are owner-controlled
                 bad.append(f"{step['name']}: {expr}")
     r.check(not bad, "no ${{ }} other than secrets.* inside any run: body", "; ".join(bad[:4]) + (" ..." if len(bad) > 4 else ""))
+
+    print("== static: the callbacks are retried, visible, and cannot mis-report a good transcode ==")
+    steps = {s["name"]: s for s in doc["jobs"]["transcode"]["steps"]}
+    ok_step, fail_step = steps["Report success"], steps["Report failure"]
+    ok_id = ok_step.get("id")
+    cond = str(fail_step.get("if", ""))
+    r.check(bool(ok_id) and "failure()" in cond and f"steps.{ok_id}.outcome != 'failure'" in cond,
+            "Report failure does NOT fire when only the success callback failed (a good transcode must never be reported failed)",
+            f"id={ok_id!r} if={cond!r}")
+
+    def policy(step):  # the retry flags, whitespace/line-continuation normalised so the two steps can be compared
+        body = re.sub(r"\s+", " ", re.sub(r"\\\s*\n", " ", step.get("run") or ""))
+        m = re.search(r"--connect-timeout \S+ --max-time \S+ --retry \S+ --retry-delay \S+ --retry-max-time \S+", body)
+        return m.group(0) if m else None
+    r.check(policy(ok_step) is not None and policy(ok_step) == policy(fail_step),
+            "both callbacks carry the SAME retry policy (--connect-timeout/--max-time/--retry/--retry-delay/--retry-max-time)",
+            f"success={policy(ok_step)!r} failure={policy(fail_step)!r}")
+    r.check(all("curl -sS" in (s.get("run") or "") for s in (ok_step, fail_step)),
+            "curl runs with -S, so the error text (e.g. 'Could not resolve host') reaches the run log, not just an exit code")
 
 
 def run_case(doc, case, frames):
@@ -221,13 +247,80 @@ def failure_step_check(doc, r):
             "failure callback body is exact, valid JSON")
 
 
+class _Portal(http.server.BaseHTTPRequestHandler):
+    """A stand-in for the portal's transcode-callback.php: replies with a scripted list of status codes (the last one
+    repeats) and records the body of every POST it receives."""
+    script, seen = [200], []
+
+    def do_POST(self):
+        cls = type(self)
+        cls.seen.append(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
+        code = cls.script[min(len(cls.seen) - 1, len(cls.script) - 1)]
+        self.send_response(code)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *a):
+        pass
+
+
+def run_report_success(doc, url):
+    """Run the workflow's real 'Report success' body under bash -e with the REAL curl. Only the retry delay is shortened,
+    through the env var the workflow itself reads, so the script under test is exactly the one that ships."""
+    st = {s["name"]: s for s in doc["jobs"]["transcode"]["steps"]}["Report success"]
+    wd = WORK / "cases" / "_callback"
+    if wd.exists():
+        shutil.rmtree(wd)
+    wd.mkdir(parents=True)
+    ctx = {"payload": {"callback_url": url, "approval_id": "99", "signature": "deadbeef"}, "outputs": {"proxy_key": PROXY_KEY}}
+    env = os.environ.copy()
+    for k, v in (st.get("env") or {}).items():
+        env[k] = substitute(v, ctx)
+    env["CALLBACK_RETRY_DELAY"] = "1"
+    (wd / "step.sh").write_bytes(substitute(st["run"], ctx).replace("\r\n", "\n").encode())
+    t0 = time.time()
+    p = subprocess.run(["bash", "-e", "step.sh"], cwd=wd, env=env, capture_output=True, timeout=180)
+    return p, time.time() - t0
+
+
+def callback_behaviour_checks(doc, r):
+    print("== callback behaviour: the REAL Report success step, real curl, a local stand-in for the portal ==")
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Portal)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/cb"
+    body = '{"approval_id": 99, "signature": "deadbeef", "status": "ok", "proxy_key": "' + PROXY_KEY + '"}'
+    try:
+        _Portal.script, _Portal.seen = [503, 503, 200], []
+        p, _ = run_report_success(doc, url)
+        r.check(p.returncode == 0 and len(_Portal.seen) == 3 and set(_Portal.seen) == {body},
+                "a portal that answers 503, 503, then 200 is retried until it accepts: exit 0, same exact body 3 times",
+                f"exit={p.returncode} posts={len(_Portal.seen)}")
+
+        _Portal.script, _Portal.seen = [401], []
+        p, _ = run_report_success(doc, url)
+        r.check(p.returncode != 0 and len(_Portal.seen) == 1 and b"::error::" in p.stdout,
+                "a permanent refusal (401: bad signature) is NOT retried, and fails with a readable ::error:: line",
+                f"exit={p.returncode} posts={len(_Portal.seen)} out={p.stdout[:120]!r}")
+    finally:
+        srv.shutdown()
+
+    p, secs = run_report_success(doc, "http://no-such-host.invalid/cb")   # .invalid can never resolve (RFC 2606)
+    r.check(p.returncode == 6 and secs >= 4,
+            "an unresolvable portal host (the 2026-09-21 failure) is retried, then fails with curl's own exit code 6",
+            f"exit={p.returncode} after {secs:.1f}s (retry delay is 1s here; no retries would end in ~0.2s)")
+    r.check(b"Could not resolve host" in p.stderr and b"::error::" in p.stdout and b"exit 6" in p.stdout,
+            "...and the log says WHY in words (curl's message + a ::error:: line that names the exit code)",
+            f"stderr={p.stderr[:100]!r} stdout={p.stdout[:100]!r}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--spec", help="git-ref:path of a workflow version to test instead of the working tree")
     ap.add_argument("--frames", action="store_true", help="write a cropped PNG of the burned text lines per case")
     ap.add_argument("--only", help="comma-separated case names")
     a = ap.parse_args()
-    for tool in ("bash", "ffmpeg", "ffprobe"):
+    for tool in ("bash", "curl", "ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             sys.exit(f"missing required tool on PATH: {tool}")
     WORK.mkdir(parents=True, exist_ok=True)
@@ -239,6 +332,7 @@ def main():
     for case in (a.only.split(",") if a.only else CASES):
         case_checks(doc, case, a.frames, r)
     failure_step_check(doc, r)
+    callback_behaviour_checks(doc, r)
     print(f"\n{'ALL CHECKS PASSED' if not r.failed else str(r.failed) + ' CHECK(S) FAILED'}")
     sys.exit(1 if r.failed else 0)
 

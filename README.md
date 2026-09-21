@@ -17,7 +17,7 @@ real `run:` bodies against a synthetic video with hostile project names:
     python tests/test_workflow.py            # must print ALL CHECKS PASSED
     python tests/test_workflow.py --frames   # also writes cropped frames of the burned text to look at
 
-Needs python3 + PyYAML, bash, ffmpeg/ffprobe. Details, and how to prove the bench can fail,
+Needs python3 + PyYAML, bash, curl, ffmpeg/ffprobe. Details, and how to prove the bench can fail,
 are in the docstring of `tests/test_workflow.py`. Add a hostile case there whenever the
 workflow starts consuming new payload text.
 

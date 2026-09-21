@@ -247,7 +247,21 @@ jobs:
             --body proxy.mp4 \
             --content-type video/mp4
 
+      # CALLBACK POLICY (2026-09-21). The callback is the ONLY way the portal learns the proxy exists, and it
+      # crosses the public internet from GitHub's network to the portal's host. On 2026-09-21 (run 35585445143)
+      # the transcode and the upload SUCCEEDED, then both callbacks died with curl exit 6 ("could not resolve
+      # host") after 10 s and 7 s: no retry, and -s hid curl's own message, so the run page said only "exit code 6".
+      # Three rules, all checked by tests/test_workflow.py:
+      #   1. RETRY. curl --retry covers a DNS failure and HTTP 408/429/5xx, but NOT a 4xx such as 401 (a bad
+      #      signature never gets better), so a real refusal still fails at once.
+      #   2. VISIBLE. -S keeps curl's error text in the log, and a ::error:: line says what happened and what to do.
+      #   3. NO FALSE FAILURE. "Report failure" runs only if something BEFORE the success callback failed. If the
+      #      success callback itself failed the transcode was fine, so reporting "failed" would be a lie (and would
+      #      probably die for the same reason).
+      # Both callbacks carry the SAME flags. CALLBACK_RETRY_DELAY is read from the environment only so the test
+      # bench can shorten it; on GitHub it is unset and the default (10 s) applies.
       - name: Report success
+        id: report_ok
         if: success()
         env:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
@@ -255,17 +269,31 @@ jobs:
           SIGNATURE: ${{ github.event.client_payload.signature }}
           PROXY_KEY: ${{ steps.keys.outputs.proxy_key }}
         run: |
-          curl -sf -X POST "$CALLBACK_URL" \
+          rc=0
+          curl -sS --fail-with-body -X POST "$CALLBACK_URL" \
+            --connect-timeout 10 --max-time 30 \
+            --retry 6 --retry-delay "${CALLBACK_RETRY_DELAY:-10}" --retry-max-time 150 \
             -H "Content-Type: application/json" \
-            -d "{\"approval_id\": $APPROVAL_ID, \"signature\": \"$SIGNATURE\", \"status\": \"ok\", \"proxy_key\": \"$PROXY_KEY\"}"
+            -d "{\"approval_id\": $APPROVAL_ID, \"signature\": \"$SIGNATURE\", \"status\": \"ok\", \"proxy_key\": \"$PROXY_KEY\"}" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::The transcode and the R2 upload SUCCEEDED, but the portal could not be told (curl exit $rc, after retries). The proxy exists; re-run this job once the portal is reachable. Exit 6 = the callback host would not resolve; 22 = the portal answered with an HTTP error (shown above)."
+            exit "$rc"
+          fi
 
       - name: Report failure
-        if: failure()
+        if: failure() && steps.report_ok.outcome != 'failure'
         env:
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
           APPROVAL_ID: ${{ github.event.client_payload.approval_id }}
           SIGNATURE: ${{ github.event.client_payload.signature }}
         run: |
-          curl -sf -X POST "$CALLBACK_URL" \
+          rc=0
+          curl -sS --fail-with-body -X POST "$CALLBACK_URL" \
+            --connect-timeout 10 --max-time 30 \
+            --retry 6 --retry-delay "${CALLBACK_RETRY_DELAY:-10}" --retry-max-time 150 \
             -H "Content-Type: application/json" \
-            -d "{\"approval_id\": $APPROVAL_ID, \"signature\": \"$SIGNATURE\", \"status\": \"failed\"}"
+            -d "{\"approval_id\": $APPROVAL_ID, \"signature\": \"$SIGNATURE\", \"status\": \"failed\"}" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::The transcode FAILED and the portal could not be told either (curl exit $rc, after retries), so the approval will stay 'pending'. Re-run this job once the portal is reachable."
+            exit "$rc"
+          fi
